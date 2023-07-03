@@ -1,7 +1,14 @@
 import * as fs from 'fs';
+import * as os from 'os';
 import * as yaml from 'js-yaml';
+import * as util from 'util';
+import * as path from 'path';
+import {URL} from 'url';
 import * as core from '@actions/core';
 import * as exec from '@actions/exec';
+import * as tc from '@actions/tool-cache';
+import * as github from '@actions/github';
+import {GitHub as Octokit} from '@actions/github/lib/utils';
 import * as actionsToolkit from '@docker/actions-toolkit';
 import {Buildx} from '@docker/actions-toolkit/lib/buildx/buildx';
 import {Builder} from '@docker/actions-toolkit/lib/buildx/builder';
@@ -34,12 +41,22 @@ actionsToolkit.run(
 
     let toolPath;
     if (Util.isValidRef(inputs.version)) {
+      if (isGitHubVersion(inputs.version)) {
+        // Download a fork of buildx.
+        await core.group(`Download buildx from GitHub Releases`, async () => {
+          toolPath = await downloadBuildxFork(inputs.version);
+        });
+      }
       if (standalone) {
         throw new Error(`Cannot build from source without the Docker CLI`);
       }
-      await core.group(`Build buildx from source`, async () => {
-        toolPath = await toolkit.buildxInstall.build(inputs.version);
-      });
+      if (!toolPath) {
+        await core.group(`Build buildx from source`, async () => {
+          core.info(`CHECKING ${inputs.version} ${isGitHubVersion(inputs.version)}`)
+          throw new Error('xxx');
+          toolPath = await toolkit.buildxInstall.build(inputs.version);
+        });
+      }
     } else if (!(await toolkit.buildx.isAvailable()) || inputs.version) {
       await core.group(`Download buildx from GitHub Releases`, async () => {
         toolPath = await toolkit.buildxInstall.download(inputs.version || 'latest');
@@ -199,3 +216,101 @@ actionsToolkit.run(
     }
   }
 );
+
+function isGitHubVersion(version: string): boolean {
+  return version.startsWith('https://github.com/');
+}
+
+async function downloadBuildxFork(url: string): Promise<string> {
+  const targetFile: string = os.platform() == 'win32' ? 'docker-buildx.exe' : 'docker-buildx';
+  let [base, version] = url.split('#');
+  if (!version) {
+    return "";
+  }
+  if (!version.startsWith('v')) {
+    core.info(`Only supports v-prefixed releases`)
+    return "";
+  }
+  version = version.substring(1)
+
+  if (!base.startsWith('https://github.com/')) {
+    core.info(`Only supports github releases. Actual: ${base}`)
+    return "";
+  }
+  
+  let [owner, repo] = base.substring('https://github.com/'.length).split('/');
+  if (!owner || !repo) {
+    core.info(`Only supports github releases. Actual: ${base}, owner: ${owner}, repo: ${repo}`)
+    return "";
+  }
+  if (repo.endsWith('.git')) {
+    repo = repo.substring(0, repo.length - 4);
+  }
+
+  core.info(`Checking for releases in ${owner}/${repo}`);
+  const cachedPath = tc.find('buildx', version, platform());
+  if (cachedPath) {
+    core.info(`Using cached download ${version}`);
+    return cachedPath;
+  }
+  
+  const octokit = github.getOctokit(process.env.GIT_AUTH_TOKEN || '');
+  const release = await octokit.request('GET https://api.github.com/repos/{owner}/{repo}/releases/tags/{tag}', {
+    repo: repo,
+    owner: owner,
+    tag: 'v' + version,
+  })
+
+  const expectedFilename = filename(version);
+  const asset = release.data.assets.find((asset) => asset.name == expectedFilename);
+  if (!asset) {
+    core.info(`Could not find download asset: ${asset}`)
+    return "";
+  }
+  const downloadURL = asset.url;
+  core.info(`Downloading ${asset.name} from ${downloadURL}`);
+
+  let auth: string | undefined = undefined;
+  if (process.env.GIT_AUTH_TOKEN) {
+    auth = `Bearer ${process.env.GIT_AUTH_TOKEN}`
+  }
+  const downloadPath = await tc.downloadTool(downloadURL.toString(), undefined, auth, {
+    'Accept': 'application/octet-stream',
+    'X-GitHub-Api-Version': '2022-11-28',
+  });
+  core.debug(`Install.fetchBinary downloadPath: ${downloadPath}`);
+  return await tc.cacheFile(downloadPath, targetFile, 'buildx', version, platform());
+}
+
+function platform(): string {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const arm_version = (process.config.variables as any).arm_version;
+  return `${os.platform()}-${os.arch()}${arm_version ? 'v' + arm_version : ''}`;
+}
+
+function filename(version: string): string {
+  let arch: string;
+  switch (os.arch()) {
+    case 'x64': {
+      arch = 'amd64';
+      break;
+    }
+    case 'ppc64': {
+      arch = 'ppc64le';
+      break;
+    }
+    case 'arm': {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const arm_version = (process.config.variables as any).arm_version;
+      arch = arm_version ? 'arm-v' + arm_version : 'arm';
+      break;
+    }
+    default: {
+      arch = os.arch();
+      break;
+    }
+  }
+  const platform: string = os.platform() == 'win32' ? 'windows' : os.platform();
+  const ext: string = os.platform() == 'win32' ? '.exe' : '';
+  return util.format('buildx-v%s.%s-%s%s', version, platform, arch, ext);
+}
