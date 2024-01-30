@@ -3,7 +3,7 @@
   "description": "Set up Docker Buildx",
   "main": "lib/main.js",
   "scripts": {
-    "build": "ncc build src/main.ts --source-map --minify --license licenses.txt",
+    "build": "ncc build src/main.ts --license licenses.txt",
     "lint": "yarn run prettier && yarn run eslint",
     "format": "yarn run prettier:fix && yarn run eslint:fix",
     "eslint": "eslint --max-warnings=0 .",
